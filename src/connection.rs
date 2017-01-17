@@ -10,8 +10,8 @@ use servermsg::{take_msg, ServerMsg, AuthMsg};
 
 #[derive(Copy, Debug, Eq, PartialEq, Clone)]
 enum ConnectionState {
-    New, 
-    AwaitingAuthResponse, 
+    New,
+    AwaitingAuthResponse,
     Authenticated,
     AuthenticationRejected,
     ReadyForQuery,
@@ -19,7 +19,7 @@ enum ConnectionState {
     AwaitingDataRows,
     Disconnected,
 }
-    
+
 
 #[derive(Debug)]
 pub struct Connection {
@@ -40,7 +40,7 @@ impl Connection {
             params: vec!(),
         };
         let bytes_to_send = startup.to_bytes();
-        try!(self.socket.write_all(&bytes_to_send)); 
+        try!(self.socket.write_all(&bytes_to_send));
         self.state = ConnectionState::AwaitingAuthResponse;
         Ok(())
     }
@@ -54,7 +54,7 @@ impl Connection {
             let mut buf = Vec::with_capacity(1024);
             let mut message_queue = VecDeque::new();
             try!(self.read_from_socket(&mut buf));
-            remainder = &buf[..];
+            let mut remainder = &buf[..];
             while remainder.len() > 0 {
                 let (bytes, excess) = try!(take_msg(remainder));
                 let msg = try!(ServerMsg::from_slice(bytes));
@@ -73,7 +73,7 @@ impl Connection {
                     },
                     state => return Err(PgError::Error(format!("Invalid startup state: {:?}", state))),
                 };
-            } 
+            }
         }
         Ok(())
     }
@@ -89,7 +89,7 @@ impl Connection {
                 let password = &self.password.clone().unwrap_or(String::new());
                 let passhash = auth::build_md5_hash(&self.user, password, salt);
                 let password_message = PasswordMessage { hash: &passhash };
-                try!(self.socket.write_all(&password_message.to_bytes()[..])); 
+                try!(self.socket.write_all(&password_message.to_bytes()[..]));
                 Ok(true)
             },
             Some(ServerMsg::Auth(method)) => {
@@ -180,7 +180,7 @@ impl Connection {
         try!(self.read_from_socket(&mut buf));
         let mut remainder = &buf[..];
         let mut data = vec![];
-            
+
         while remainder.len() > 0 {
             let (bytes, excess) = try!(take_msg(remainder));
             let msg = try!(ServerMsg::from_slice(bytes));
