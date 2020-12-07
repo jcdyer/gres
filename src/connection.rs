@@ -2,11 +2,12 @@ use std::collections::vec_deque::VecDeque;
 use std::io::{Read, Write};
 use std::net;
 use std::time::Duration;
-use Result;
-use auth;
-use error::PgError;
-use message::{Message, StartupMessage, Query, PasswordMessage, Terminate};
-use servermsg::{take_msg, ServerMsg, AuthMsg};
+use crate::auth;
+use crate::error::PgError;
+use log::trace;
+use crate::message::{Message, StartupMessage, Query, PasswordMessage, Terminate};
+use crate::servermsg::{take_msg, ServerMsg, AuthMsg};
+use crate::Result;
 
 #[derive(Copy, Debug, Eq, PartialEq, Clone)]
 enum ConnectionState {
@@ -40,7 +41,8 @@ impl Connection {
             params: vec!(),
         };
         let bytes_to_send = startup.to_bytes();
-        try!(self.socket.write_all(&bytes_to_send));
+        trace!("sending {:?}", &bytes_to_send);
+        self.socket.write_all(&bytes_to_send)?;
         self.state = ConnectionState::AwaitingAuthResponse;
         Ok(())
     }
@@ -53,22 +55,22 @@ impl Connection {
         } {
             let mut buf = Vec::with_capacity(1024);
             let mut message_queue = VecDeque::new();
-            try!(self.read_from_socket(&mut buf));
+            self.read_from_socket(&mut buf)?;
             let mut remainder = &buf[..];
-            while remainder.len() > 0 {
-                let (bytes, excess) = try!(take_msg(remainder));
-                let msg = try!(ServerMsg::from_slice(bytes));
+            while !remainder.is_empty() {
+                let (bytes, excess) = take_msg(remainder)?;
+                let msg = ServerMsg::from_slice(bytes)?;
                 message_queue.push_back(msg);
                 remainder = excess;
             }
             println!("VecDeque: {:?}", message_queue);
-            while message_queue.len() > 0 {
-                match self.state.clone() {
-                    ConnectionState::AwaitingAuthResponse => try!(self.handle_auth(&mut message_queue)),
+            while !message_queue.is_empty() {
+                match self.state {
+                    ConnectionState::AwaitingAuthResponse => self.handle_auth(&mut message_queue)?,
                     ConnectionState::AuthenticationRejected => false,
-                    ConnectionState::Authenticated => try!(self.handle_server_info(&mut message_queue)),
+                    ConnectionState::Authenticated => self.handle_server_info(&mut message_queue)?,
                     ConnectionState::ReadyForQuery => {
-                        try!(self.handle_ready_for_query(&mut message_queue));
+                        self.handle_ready_for_query(&mut message_queue)?;
                         break;
                     },
                     state => return Err(PgError::Error(format!("Invalid startup state: {:?}", state))),
@@ -86,16 +88,18 @@ impl Connection {
                 Ok(false)
             },
             Some(ServerMsg::Auth(AuthMsg::Md5(salt))) => {
-                let password = &self.password.clone().unwrap_or(String::new());
+                let password = &self.password.clone().unwrap_or_default();
                 let passhash = auth::build_md5_hash(&self.user, password, salt);
-                let password_message = PasswordMessage { hash: &passhash };
-                try!(self.socket.write_all(&password_message.to_bytes()[..]));
+                let password_message = PasswordMessage { hash: &passhash }.to_bytes();
+                trace!("sending {:?}", &password_message);
+
+                self.socket.write_all(&password_message)?;
                 Ok(true)
             },
             Some(ServerMsg::Auth(method)) => {
                 Err(PgError::Error(format!("Unimplemented authentication method, {:?}", method)))
             },
-            Some(ServerMsg::ErrorResponse(err)) => try!(self.handle_error(err)),
+            Some(ServerMsg::ErrorResponse(err)) => self.handle_error(err)?,
             Some(msg) => Err(PgError::Error(format!("Unexpected non-auth message: {:?}", msg))),
             None => Err(PgError::Error("No message received".to_string())),
         }
@@ -107,7 +111,7 @@ impl Connection {
                 self.state = ConnectionState::ReadyForQuery;
                 Ok(false)
             },
-            Some(ServerMsg::ErrorResponse(err)) => try!(self.handle_error(err)),
+            Some(ServerMsg::ErrorResponse(err)) => self.handle_error(err)?,
             Some(_) => Ok(false),
             None => Ok(true)
         }
@@ -137,20 +141,20 @@ impl Connection {
         let user = user.to_string();
         let host = host.to_string();
         let port = 5432;
-        let socket = try!(net::TcpStream::connect((host.as_str(), port)));
-        try!(socket.set_read_timeout(Some(Duration::new(0, 1))));
-        try!(socket.set_nodelay(true));
+        let socket = net::TcpStream::connect((host.as_str(), port))?;
+        socket.set_read_timeout(Some(Duration::new(0, 1)))?;
+        socket.set_nodelay(true)?;
         let mut conn = Connection {
-            user: user.clone(),
-            password: password,
-            database: database.clone(),
-            host: host,
-            port: port,
-            socket: socket,
+            user,
+            password,
+            database,
+            host,
+            port,
+            socket,
             state: ConnectionState::New,
         };
-        try!(conn.initiate_connection());
-        try!(conn.handle_startup());
+        conn.initiate_connection()?;
+        conn.handle_startup()?;
         match conn.state {
             ConnectionState::ReadyForQuery => Ok(conn),
             ConnectionState::AuthenticationRejected => Err(PgError::Unauthenticated),
@@ -158,32 +162,34 @@ impl Connection {
         }
     }
 
+    // This looks janky?
     fn read_from_socket(&mut self, buf: &mut Vec<u8>) -> Result<usize> {
-        while buf.len() == 0 {
+        while buf.is_empty() {
             match self.socket.read_to_end(buf) {
                 Ok(_) => continue,
                 Err(ioerr) => if let Some(11) = ioerr.raw_os_error() {
                     continue;
                 } else {
-                    try!(Err(ioerr));
+                    return Err(ioerr.into());
                 },
             }
         }
+        trace!("received {:?}", buf);
         Ok(buf.len())
     }
 
     pub fn query(&mut self, sql: &str) -> Result<Vec<Vec<String>>> {
         let query = Query { query: sql.to_string() };
-        try!(self.socket.write_all(&query.to_bytes()));
+        self.socket.write_all(&query.to_bytes())?;
         self.state = ConnectionState::AwaitingQueryResponse;
         let mut buf: Vec<u8> = vec!();
-        try!(self.read_from_socket(&mut buf));
+        self.read_from_socket(&mut buf)?;
         let mut remainder = &buf[..];
         let mut data = vec![];
 
-        while remainder.len() > 0 {
-            let (bytes, excess) = try!(take_msg(remainder));
-            let msg = try!(ServerMsg::from_slice(bytes));
+        while !remainder.is_empty() {
+            let (bytes, excess) = take_msg(remainder)?;
+            let msg = ServerMsg::from_slice(bytes)?;
             remainder = excess;
             match msg {
                 ServerMsg::DataRow(vec) => {
@@ -198,7 +204,7 @@ impl Connection {
                 },
                 ServerMsg::CommandComplete(_) => {},
                 ServerMsg::ReadyForQuery => {
-                    if remainder.len() > 0 {
+                    if !remainder.is_empty()  {
                         return Err(PgError::Error(
                             format!("Received data after ReadyForQuery: {:?}", remainder)
                         ));
@@ -230,10 +236,16 @@ impl Drop for Connection {
 #[cfg(test)]
 mod tests {
     use std::env;
+
     use super::Connection;
+
+    fn init_log() {
+        pretty_env_logger::init();
+    }
 
     #[test]
     fn test_connect() {
+        init_log();
         let user_string = env::var("USER").unwrap();
         let user = user_string.as_ref();
         let pass = Some(user);
@@ -262,7 +274,7 @@ mod tests {
         let mut conn = Connection::new(user, pass, host, Some(user)).expect("Could not establish connection");
         let data = conn.query("SELECT VERSION();").unwrap();
         assert_eq!(data.len(), 1);
-        let ref result = data[0][0];
+        let result = &data[0][0];
         assert_eq!(&result[..10], "PostgreSQL");
     }
 }

@@ -4,7 +4,7 @@ use crypto::md5::Md5;
 pub fn build_md5_hash(user: &str, password: &str, salt: &[u8]) -> String {
     let mut userpasshasher = Md5::new();
     let mut final_hash = String::with_capacity(35);
-    final_hash.extend("md5".chars());
+    final_hash.push_str("md5");
 
     userpasshasher.input_str(password);
     userpasshasher.input_str(user);
@@ -12,10 +12,10 @@ pub fn build_md5_hash(user: &str, password: &str, salt: &[u8]) -> String {
     let mut saltedhasher = Md5::new();
     saltedhasher.input_str(&hash);
     saltedhasher.input(salt);
-    final_hash.extend(saltedhasher.result_str().chars());
+    final_hash.push_str(&saltedhasher.result_str());
     final_hash
 }
-    
+
 
 #[cfg(test)]
 mod tests {

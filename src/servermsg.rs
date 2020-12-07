@@ -1,75 +1,50 @@
-use std::str::from_utf8;
-use Result;
-use error::PgError;
 use self::erg::*;
-
+use crate::error::PgError;
+use crate::Result;
+use std::str::from_utf8;
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum FieldFormat {
     Text,
-    Binary
+    Binary,
 }
 
 mod erg {
-    use std::str::from_utf8;
-    use Result;
-    use error::PgError;
+    use crate::error::PgError;
+    use crate::Result;
+    use std::{convert::TryInto, str::from_utf8};
 
-    pub fn find_first<T: Eq>(input: &[T], matched: T) -> Option<usize> {
-        let mut x = input.len();
-        for i in 0..input.len() {
-            if input[i] == matched {
-                x = i;
-                break
-            }
-        }
-        if x == input.len() {
-            None
-        } else {
-            Some(x)
-        }
+    pub fn find_first<T: Eq>(input: &[T], matched: &T) -> Option<usize> {
+        input.iter().position(|val| val == matched)
     }
 
     pub fn slice_to_u32(input: &[u8]) -> u32 {
-        if input.len() != 4 {
-            panic!("Expected four bytes");
-        }
-        let mut value: u32 = 0;
-        for x in input {
-            value <<= 8;
-            value += *x as u32;
-        }
-        value
+        u32::from_be_bytes(input.try_into().expect("expected four bytes"))
     }
 
     pub fn slice_to_u16(input: &[u8]) -> u16 {
-        if input.len() != 2 {
-            panic!("Expected two bytes");
-        }
-        let mut value: u16 = 0;
-        for x in input {
-            value <<= 8;
-            value += *x as u16;
-        }
-        value
+        u16::from_be_bytes(input.try_into().expect("expected two bytes"))
     }
 
-    pub fn take_cstring_plus_fixed<'a>(input: &'a[u8], fixed: usize) -> Result<(&'a str, &'a[u8], &'a[u8])> {
-        let strlen = find_first(input, b'\0');
+    pub fn take_cstring_plus_fixed<'a>(
+        input: &'a [u8],
+        fixed: usize,
+    ) -> Result<(&'a str, &'a [u8], &'a [u8])> {
+        let strlen = find_first(input, &0);
         match strlen {
             Some(strlen) => {
-                let string = try!(from_utf8(&input[..strlen]));
-                let fixed_data = &input[strlen+1..strlen+1+fixed];
-                let extra = &input[strlen+1+fixed..];
+                let string = from_utf8(&input[..strlen])?;
+                let fixed_data = &input[strlen + 1..strlen + 1 + fixed];
+                let extra = &input[strlen + 1 + fixed..];
                 Ok((string, fixed_data, extra))
-            },
-            None => Err(PgError::Error("null byte not found".to_string()))
+            }
+            None => Err(PgError::Error("null byte not found".to_string())),
         }
     }
-    pub fn take_sized_string<'a>(input: &'a[u8]) -> Result<(&'a str, &'a[u8])> {
+    pub fn take_sized_string<'a>(input: &'a [u8]) -> Result<(&'a str, &'a [u8])> {
         let size = slice_to_u32(&input[..4]) as usize;
-        let data = try!(from_utf8(&input[4..4+size]));
-        let extra = &input[4+size..];
+        let data = from_utf8(&input[4..4 + size])?;
+        let extra = &input[4 + size..];
         Ok((data, extra))
     }
 }
@@ -77,15 +52,15 @@ mod erg {
 #[derive(Debug, Eq, PartialEq)]
 pub struct FieldDescription<'a> {
     field_name: &'a str,
-    format: FieldFormat
+    format: FieldFormat,
 }
 
-impl <'a> FieldDescription<'a> {
-    fn take_field(input: &'a[u8]) -> Result<(&'a str, &'a[u8], &'a[u8])> {
+impl<'a> FieldDescription<'a> {
+    fn take_field(input: &'a [u8]) -> Result<(&'a str, &'a [u8], &'a [u8])> {
         take_cstring_plus_fixed(input, 18)
     }
 
-    fn new(name: &'a str, fixed_data: &'a[u8]) -> Result<FieldDescription<'a>> {
+    fn new(name: &'a str, fixed_data: &'a [u8]) -> Result<FieldDescription<'a>> {
         let format = match slice_to_u16(&fixed_data[16..18]) {
             0 => FieldFormat::Text,
             1 => FieldFormat::Binary,
@@ -93,55 +68,62 @@ impl <'a> FieldDescription<'a> {
         };
         Ok(FieldDescription {
             field_name: name,
-            format: format,
+            format,
         })
     }
 }
 
-
 #[derive(Debug, PartialEq, Eq)]
 pub enum ServerMsg<'a> {
     ErrorResponse(Vec<&'a str>),
-    NoticeResponse(&'a[u8]),
+    NoticeResponse(&'a [u8]),
     Auth(AuthMsg<'a>),
     ReadyForQuery,
     CommandComplete(&'a str),
     ParamStatus(&'a str, &'a str),
     BackendKeyData(u32, u32),
-    RowDescription(Vec<FieldDescription<'a>>),  // TBD
-    DataRow(Vec<&'a str>),  // TBD
-    Unknown(&'a str, &'a[u8]),  // TBD
+    RowDescription(Vec<FieldDescription<'a>>), // TBD
+    DataRow(Vec<&'a str>),                     // TBD
+    Unknown(&'a str, &'a [u8]),                // TBD
 }
 
-impl <'a> ServerMsg<'a> {
+impl<'a> ServerMsg<'a> {
     pub fn from_slice(message: &[u8]) -> Result<ServerMsg> {
-        let length = 1 + slice_to_u32(&message[1 .. 5]) as usize;
+        let length = 1 + slice_to_u32(&message[1..5]) as usize;
         if message.len() != length {
-            return Err(PgError::Error(format!("Wrong length for message.  Expected {}.  Found {}.", length, message.len())))
+            return Err(PgError::Error(format!(
+                "Wrong length for message.  Expected {}.  Found {}.",
+                length,
+                message.len()
+            )));
         }
-        let identifier = try!(from_utf8(&message[..1]));
+        let identifier = from_utf8(&message[..1])?;
         let (_, extra) = message.split_at(5);
         match identifier {
-            "R" => {
-                AuthMsg::from_slice(extra).map(ServerMsg::Auth)
-            },
-            "S" => {  // Parameter Status
+            "R" => AuthMsg::from_slice(extra).map(ServerMsg::Auth),
+            "S" => {
+                // Parameter Status
                 let mut param_iter = extra.split(|c| c == &0); // split on nulls
-                let name = try!(from_utf8(param_iter.next().unwrap()));
-                let value = try!(from_utf8(param_iter.next().unwrap()));
+                let name = from_utf8(param_iter.next().unwrap())?;
+                let value = from_utf8(param_iter.next().unwrap())?;
                 let nothing = param_iter.next().unwrap(); // The second null is the terminator
-                if nothing != [] {
-                    Err(PgError::Error(format!("Extra value after param status: {:?}", nothing)))
+                if !nothing.is_empty() {
+                    Err(PgError::Error(format!(
+                        "Extra value after param status: {:?}",
+                        nothing
+                    )))
                 } else {
                     Ok(ServerMsg::ParamStatus(name, value))
                 }
-            },
-            "K" => {  // BackendKeyData
+            }
+            "K" => {
+                // BackendKeyData
                 let pid = slice_to_u32(&extra[..4]);
                 let key = slice_to_u32(&extra[4..]);
                 Ok(ServerMsg::BackendKeyData(pid, key))
-            },
-            "T" => {  // Row Description
+            }
+            "T" => {
+                // Row Description
                 let field_count = slice_to_u16(&extra[..2]);
                 let mut extra = &extra[2..];
                 let mut fields = vec![];
@@ -155,10 +137,14 @@ impl <'a> ServerMsg<'a> {
                 if extra == &b""[..] {
                     Ok(ServerMsg::RowDescription(fields))
                 } else {
-                    Err(PgError::Error(format!("Unexpected extra data in row description: {:?}", extra)))
+                    Err(PgError::Error(format!(
+                        "Unexpected extra data in row description: {:?}",
+                        extra
+                    )))
                 }
-            },
-            "D" => {  // Data Row
+            }
+            "D" => {
+                // Data Row
                 let field_count = slice_to_u16(&extra[..2]);
                 let mut extra = &extra[2..];
                 let mut fields = vec![];
@@ -170,63 +156,69 @@ impl <'a> ServerMsg<'a> {
                 if extra == &b""[..] {
                     Ok(ServerMsg::DataRow(fields))
                 } else {
-                    Err(PgError::Error(format!("Unexpected extra data in data row: {:?}", extra)))
+                    Err(PgError::Error(format!(
+                        "Unexpected extra data in data row: {:?}",
+                        extra
+                    )))
                 }
-            },
-            "C" => {  // Command Complete
+            }
+            "C" => {
+                // Command Complete
                 let (command_tag, _, extra) = take_cstring_plus_fixed(extra, 0).unwrap();
                 if extra == &b""[..] {
                     Ok(ServerMsg::CommandComplete(command_tag))
                 } else {
-                    Err(PgError::Error(format!("Unexpected extra data in command complate: {:?}", extra)))
+                    Err(PgError::Error(format!(
+                        "Unexpected extra data in command complate: {:?}",
+                        extra
+                    )))
                 }
-            },
-            "Z" => {  // ReadyForQuery
+            }
+            "Z" => {
+                // ReadyForQuery
                 Ok(ServerMsg::ReadyForQuery)
-            },
-            "N" => { // NoticeResponse
+            }
+            "N" => {
+                // NoticeResponse
                 Ok(ServerMsg::NoticeResponse(extra))
-            },
-            "E" => { // ErrorResponse
+            }
+            "E" => {
+                // ErrorResponse
                 let mut errors = Vec::new();
                 let mut remainder = extra;
-                if let None = remainder.get(0) {
+                if remainder.is_empty() {
                     Err(PgError::Error(format!("No terminator in {:?}", extra)))
                 } else {
                     while remainder.get(0) != Some(&0) {
-	                let (msg, _, end) = take_cstring_plus_fixed(&remainder[1..], 0).unwrap();
+                        let (msg, _, end) = take_cstring_plus_fixed(&remainder[1..], 0).unwrap();
                         errors.push(msg);
                         remainder = end;
-                        if let None = remainder.get(0) {
-                            return Err(PgError::Error(format!("No terminator in {:?}", extra)))
+                        if remainder.is_empty() {
+                            return Err(PgError::Error(format!("No terminator in {:?}", extra)));
                         }
                     }
                     Ok(ServerMsg::ErrorResponse(errors))
                 }
-            },
-            _ => {
-                Ok(ServerMsg::Unknown(identifier, extra))
-            },
+            }
+            _ => Ok(ServerMsg::Unknown(identifier, extra)),
         }
     }
 }
-
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum AuthMsg<'a> {
     Ok,
     Kerberos,
     Cleartext,
-    Md5(&'a[u8]),
+    Md5(&'a [u8]),
     ScmCredential,
     Gss,
     Sspi,
-    GssContinue(&'a[u8]),
+    GssContinue(&'a [u8]),
     Unknown,
 }
 
-
-impl <'a> AuthMsg<'a> {
+impl<'a> AuthMsg<'a> {
     pub fn from_slice(extra: &'a [u8]) -> Result<AuthMsg> {
         match slice_to_u32(&extra[0..4]) {
             0 => Ok(AuthMsg::Ok),
@@ -235,16 +227,16 @@ impl <'a> AuthMsg<'a> {
             5 => {
                 let salt = &extra[4..8];
                 Ok(AuthMsg::Md5(salt))
-            },
+            }
             6 => Ok(AuthMsg::ScmCredential),
             7 => Ok(AuthMsg::Gss),
             8 => {
                 let gss_data = &extra[4..8];
                 Ok(AuthMsg::GssContinue(gss_data))
-            },
+            }
             9 => Ok(AuthMsg::Sspi),
-            1|4|10...255 => Ok(AuthMsg::Unknown),
-            _ => Err(PgError::Other)
+            1 | 4 | 10..=255 => Ok(AuthMsg::Unknown),
+            _ => Err(PgError::Other),
         }
     }
 }
@@ -253,7 +245,7 @@ pub fn take_msg(input: &[u8]) -> Result<(&[u8], &[u8])> {
     if input.len() < 5 {
         Err(PgError::Error(format!("Input too short: {:?}", input)))
     } else {
-        let length = 1 + slice_to_u32(&input[1 .. 5]) as usize;
+        let length = 1 + slice_to_u32(&input[1..5]) as usize;
         if input.len() < length {
             Err(PgError::Error(format!("Message too short: {:?}", input)))
         } else {
@@ -273,7 +265,7 @@ mod tests {
         assert_eq!(first, [69, 0, 0, 0, 5, 1]);
         let (second, nothing) = take_msg(rest).unwrap();
         assert_eq!(second, [72, 0, 0, 0, 12, 1, 2, 3, 4, 5, 6, 7, 8]);
-        assert_eq!(nothing, []);
+        assert!(nothing.is_empty());
     }
 
     #[test]
@@ -326,12 +318,18 @@ mod tests {
 
         let (next, buffer) = take_msg(buffer).unwrap();
         let msg = ServerMsg::from_slice(next).unwrap();
-        assert_eq!(msg, ServerMsg::ParamStatus("session_authorization", "cliff"));
+        assert_eq!(
+            msg,
+            ServerMsg::ParamStatus("session_authorization", "cliff")
+        );
         assert_eq!(buffer.len(), 80);
 
         let (next, buffer) = take_msg(buffer).unwrap();
         let msg = ServerMsg::from_slice(next).unwrap();
-        assert_eq!(msg, ServerMsg::ParamStatus("standard_conforming_strings", "on"));
+        assert_eq!(
+            msg,
+            ServerMsg::ParamStatus("standard_conforming_strings", "on")
+        );
         assert_eq!(buffer.len(), 44);
 
         let (next, buffer) = take_msg(buffer).unwrap();
@@ -341,12 +339,7 @@ mod tests {
 
         let (next, buffer) = take_msg(buffer).unwrap();
         let msg = ServerMsg::from_slice(next).unwrap();
-        assert!(
-            match msg {
-                ServerMsg::BackendKeyData(..) => true,
-                _ => false,
-            }
-        );
+        assert!(matches!(msg, ServerMsg::BackendKeyData(..)));
         assert_eq!(buffer.len(), 6);
 
         let (next, buffer) = take_msg(buffer).unwrap();
@@ -365,12 +358,10 @@ mod tests {
         let msg = ServerMsg::from_slice(next).unwrap();
         assert_eq!(
             msg,
-            ServerMsg::RowDescription(
-                vec![FieldDescription {
-                    field_name: "version",
-                    format: FieldFormat::Text,
-                }]
-            )
+            ServerMsg::RowDescription(vec![FieldDescription {
+                field_name: "version",
+                format: FieldFormat::Text,
+            }])
         );
         assert_eq!(buffer.len(), 116);
 

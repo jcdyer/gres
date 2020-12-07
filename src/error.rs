@@ -25,17 +25,7 @@ impl fmt::Display for PgError {
 }
 
 impl Error for PgError {
-    fn description(&self) -> &str {
-        match *self {
-            PgError::Io(ref err) => err.description(),
-            PgError::Utf8(ref err) => err.description(),
-            PgError::Error(ref string) => string,
-            PgError::Unauthenticated => "Unauthenticated",
-            PgError::Other => "An error occurred",
-        }
-    }
-
-    fn cause(&self) -> Option<&Error> {
+    fn cause(&self) -> Option<&dyn Error> {
         match *self {
             PgError::Io(ref err) => Some(err),
             PgError::Utf8(ref err) => Some(err),
