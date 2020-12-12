@@ -1,9 +1,216 @@
 use self::erg::*;
 use crate::error::PgError;
 use crate::Result;
-use std::str::from_utf8;
+use std::{collections::HashMap, str::from_utf8};
 
-#[derive(Debug, Eq, PartialEq)]
+
+#[derive(Debug, PartialEq)]
+pub enum ServerMsg<'a> {
+    ErrorResponse(NoticeBody<'a>),
+    NoticeResponse(NoticeBody<'a>),
+    Auth(AuthMsg<'a>),
+    ReadyForQuery,
+    CommandComplete(&'a str),
+    ParamStatus(&'a str, &'a str),
+    BackendKeyData(u32, u32),
+    RowDescription(Vec<FieldDescription<'a>>), // TBD
+    DataRow(Vec<&'a str>),                     // TBD
+    Unknown(&'a str, &'a [u8]),                // TBD
+    ParseComplete,
+    BindComplete,
+    CloseComplete,
+}
+
+impl<'a> ServerMsg<'a> {
+    pub fn from_slice(message: &[u8]) -> Result<ServerMsg> {
+        let length = 1 + slice_to_u32(&message[1..5]) as usize;
+        if message.len() != length {
+            return Err(PgError::Error(format!(
+                "Wrong length for message.  Expected {}.  Found {}.",
+                length,
+                message.len()
+            )));
+        }
+        let identifier = from_utf8(&message[..1])?;
+        let (_, extra) = message.split_at(5);
+        match identifier {
+            "I" => {
+                if extra.is_empty() {
+                    Ok(ServerMsg::ParseComplete)
+                } else {
+                    Err(PgError::Error(format!(
+                        "Extra value after param status: {:?}",
+                        extra
+                    )))
+                }
+            }
+            "R" => AuthMsg::from_slice(extra).map(ServerMsg::Auth),
+            "S" => {
+                // Parameter Status
+                let mut param_iter = extra.split(|c| c == &0); // split on nulls
+                let name = from_utf8(param_iter.next().unwrap())?;
+                let value = from_utf8(param_iter.next().unwrap())?;
+                let nothing = param_iter.next().unwrap(); // The second null is the terminator
+                if !nothing.is_empty() {
+                    Err(PgError::Error(format!(
+                        "Extra value after param status: {:?}",
+                        nothing
+                    )))
+                } else {
+                    Ok(ServerMsg::ParamStatus(name, value))
+                }
+            }
+            "K" => {
+                // BackendKeyData
+                let pid = slice_to_u32(&extra[..4]);
+                let key = slice_to_u32(&extra[4..]);
+                Ok(ServerMsg::BackendKeyData(pid, key))
+            }
+            "T" => {
+                println!("{:?}", extra);
+                // Row Description
+                let field_count = slice_to_u16(&extra[..2]);
+                let mut extra = &extra[2..];
+                let mut fields = vec![];
+
+                for _ in 0..field_count {
+                    let (name, bytes, rem) = FieldDescription::take_field(extra).unwrap();
+                    let fd = FieldDescription::new(name, bytes).unwrap();
+                    fields.push(fd);
+                    extra = rem;
+                }
+                if extra == &b""[..] {
+                    Ok(ServerMsg::RowDescription(fields))
+                } else {
+                    Err(PgError::Error(format!(
+                        "Unexpected extra data in row description: {:?}",
+                        extra
+                    )))
+                }
+            }
+            "D" => {
+                // Data Row
+                let field_count = slice_to_u16(&extra[..2]);
+                let mut extra = &extra[2..];
+                let mut fields = vec![];
+                for _ in 0..field_count {
+                    let (string, more) = take_sized_string(extra).unwrap();
+                    fields.push(string);
+                    extra = more;
+                }
+                if extra == &b""[..] {
+                    Ok(ServerMsg::DataRow(fields))
+                } else {
+                    Err(PgError::Error(format!(
+                        "Unexpected extra data in data row: {:?}",
+                        extra
+                    )))
+                }
+            }
+            "C" => {
+                // Command Complete
+                let (command_tag, _, extra) = take_cstring_plus_fixed(extra, 0).unwrap();
+                if extra == &b""[..] {
+                    Ok(ServerMsg::CommandComplete(command_tag))
+                } else {
+                    Err(PgError::Error(format!(
+                        "Unexpected extra data in command complate: {:?}",
+                        extra
+                    )))
+                }
+            }
+            "Z" => {
+                // ReadyForQuery
+                Ok(ServerMsg::ReadyForQuery)
+            }
+            "N" => {
+                // NoticeResponse
+
+                Ok(ServerMsg::NoticeResponse(NoticeBody::from_bytes(extra)?))
+            }
+            "E" => {
+                // ErrorResponse
+                Ok(ServerMsg::ErrorResponse(NoticeBody::from_bytes(extra)?))
+            }
+            "1" => {
+                // ParseComplete
+                if extra.is_empty() {
+                    Ok(ServerMsg::ParseComplete)
+                } else {
+                    Err(PgError::Error(format!("Extra data: {:?}", extra)))
+                }
+            }
+            "2" => {
+                // BindComplete
+                if extra.is_empty() {
+                    Ok(ServerMsg::BindComplete)
+                } else {
+                    Err(PgError::Error(format!("Extra data: {:?}", extra)))
+                }
+            }
+            "3" => {
+                // CloseComplete
+                if extra.is_empty() {
+                    Ok(ServerMsg::CloseComplete)
+                } else {
+                    Err(PgError::Error(format!("Extra data: {:?}", extra)))
+                }
+            }
+            _ => Ok(ServerMsg::Unknown(identifier, extra)),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum AuthMsg<'a> {
+    Ok,
+    Kerberos,
+    Cleartext,
+    Md5(&'a [u8]),
+    ScmCredential,
+    Gss,
+    Sspi,
+    GssContinue(&'a [u8]),
+    Unknown,
+}
+
+impl<'a> AuthMsg<'a> {
+    pub fn from_slice(extra: &'a [u8]) -> Result<AuthMsg> {
+        match slice_to_u32(&extra[0..4]) {
+            0 => Ok(AuthMsg::Ok),
+            2 => Ok(AuthMsg::Kerberos),
+            3 => Ok(AuthMsg::Cleartext),
+            5 => {
+                let salt = &extra[4..8];
+                Ok(AuthMsg::Md5(salt))
+            }
+            6 => Ok(AuthMsg::ScmCredential),
+            7 => Ok(AuthMsg::Gss),
+            8 => {
+                let gss_data = &extra[4..8];
+                Ok(AuthMsg::GssContinue(gss_data))
+            }
+            9 => Ok(AuthMsg::Sspi),
+            1 | 4 | 10..=255 => Ok(AuthMsg::Unknown),
+            _ => Err(PgError::Other),
+        }
+    }
+}
+
+pub fn take_msg(input: &[u8]) -> Result<(&[u8], &[u8])> {
+    if input.len() < 5 {
+        Err(PgError::Error(format!("Input too short: {:?}", input)))
+    } else {
+        let length = 1 + slice_to_u32(&input[1..5]) as usize;
+        if input.len() < length {
+            Err(PgError::Error(format!("Message too short: {:?}", input)))
+        } else {
+            Ok(input.split_at(length))
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum FieldFormat {
     Text,
     Binary,
@@ -73,184 +280,116 @@ impl<'a> FieldDescription<'a> {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
-pub enum ServerMsg<'a> {
-    ErrorResponse(Vec<&'a str>),
-    NoticeResponse(&'a [u8]),
-    Auth(AuthMsg<'a>),
-    ReadyForQuery,
-    CommandComplete(&'a str),
-    ParamStatus(&'a str, &'a str),
-    BackendKeyData(u32, u32),
-    RowDescription(Vec<FieldDescription<'a>>), // TBD
-    DataRow(Vec<&'a str>),                     // TBD
-    Unknown(&'a str, &'a [u8]),                // TBD
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Severity {
+    Error,
+    Fatal,
+    Panic,
+    Warning,
+    Notice,
+    Debug,
+    Info,
+    Log,
 }
 
-impl<'a> ServerMsg<'a> {
-    pub fn from_slice(message: &[u8]) -> Result<ServerMsg> {
-        let length = 1 + slice_to_u32(&message[1..5]) as usize;
-        if message.len() != length {
-            return Err(PgError::Error(format!(
-                "Wrong length for message.  Expected {}.  Found {}.",
-                length,
-                message.len()
-            )));
-        }
-        let identifier = from_utf8(&message[..1])?;
-        let (_, extra) = message.split_at(5);
-        match identifier {
-            "R" => AuthMsg::from_slice(extra).map(ServerMsg::Auth),
-            "S" => {
-                // Parameter Status
-                let mut param_iter = extra.split(|c| c == &0); // split on nulls
-                let name = from_utf8(param_iter.next().unwrap())?;
-                let value = from_utf8(param_iter.next().unwrap())?;
-                let nothing = param_iter.next().unwrap(); // The second null is the terminator
-                if !nothing.is_empty() {
-                    Err(PgError::Error(format!(
-                        "Extra value after param status: {:?}",
-                        nothing
-                    )))
-                } else {
-                    Ok(ServerMsg::ParamStatus(name, value))
-                }
-            }
-            "K" => {
-                // BackendKeyData
-                let pid = slice_to_u32(&extra[..4]);
-                let key = slice_to_u32(&extra[4..]);
-                Ok(ServerMsg::BackendKeyData(pid, key))
-            }
-            "T" => {
-                // Row Description
-                let field_count = slice_to_u16(&extra[..2]);
-                let mut extra = &extra[2..];
-                let mut fields = vec![];
+impl Severity {
+    fn new(s: &str) -> Option<Severity> {
+        Some(match s {
+            "ERROR" => Severity::Error,
+            "FATAL" => Severity::Fatal,
+            "PANIC" => Severity::Panic,
+            "WARNING" => Severity::Warning,
+            "NOTICE" => Severity::Notice,
+            "DEBUG" => Severity::Debug,
+            "INFO" => Severity::Info,
+            "LOG" => Severity::Log,
+            _ => return None,
+        })
+    }
+}
 
-                for _ in [..field_count].iter() {
-                    let (name, bytes, rem) = FieldDescription::take_field(extra).unwrap();
-                    let fd = FieldDescription::new(name, bytes).unwrap();
-                    fields.push(fd);
-                    extra = rem;
-                }
-                if extra == &b""[..] {
-                    Ok(ServerMsg::RowDescription(fields))
-                } else {
-                    Err(PgError::Error(format!(
-                        "Unexpected extra data in row description: {:?}",
-                        extra
-                    )))
-                }
-            }
-            "D" => {
-                // Data Row
-                let field_count = slice_to_u16(&extra[..2]);
-                let mut extra = &extra[2..];
-                let mut fields = vec![];
-                for _ in [..field_count].iter() {
-                    let (string, more) = take_sized_string(extra).unwrap();
-                    fields.push(string);
-                    extra = more;
-                }
-                if extra == &b""[..] {
-                    Ok(ServerMsg::DataRow(fields))
-                } else {
-                    Err(PgError::Error(format!(
-                        "Unexpected extra data in data row: {:?}",
-                        extra
-                    )))
-                }
-            }
-            "C" => {
-                // Command Complete
-                let (command_tag, _, extra) = take_cstring_plus_fixed(extra, 0).unwrap();
-                if extra == &b""[..] {
-                    Ok(ServerMsg::CommandComplete(command_tag))
-                } else {
-                    Err(PgError::Error(format!(
-                        "Unexpected extra data in command complate: {:?}",
-                        extra
-                    )))
-                }
-            }
-            "Z" => {
-                // ReadyForQuery
-                Ok(ServerMsg::ReadyForQuery)
-            }
-            "N" => {
-                // NoticeResponse
-                Ok(ServerMsg::NoticeResponse(extra))
-            }
-            "E" => {
-                // ErrorResponse
-                let mut errors = Vec::new();
-                let mut remainder = extra;
-                if remainder.is_empty() {
-                    Err(PgError::Error(format!("No terminator in {:?}", extra)))
-                } else {
-                    while remainder.get(0) != Some(&0) {
-                        let (msg, _, end) = take_cstring_plus_fixed(&remainder[1..], 0).unwrap();
-                        errors.push(msg);
-                        remainder = end;
-                        if remainder.is_empty() {
-                            return Err(PgError::Error(format!("No terminator in {:?}", extra)));
-                        }
-                    }
-                    Ok(ServerMsg::ErrorResponse(errors))
-                }
-            }
-            _ => Ok(ServerMsg::Unknown(identifier, extra)),
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Position<'a> {
+    Public(usize),
+    Internal { position: usize, query: &'a str },
+}
+
+impl<'a> Position<'a> {
+    pub fn position(&self) -> usize {
+        use Position::*;
+        match self {
+            Public(pos) => *pos,
+            Internal { position, .. } => *position,
+        }
+    }
+
+    pub fn query(&self) -> Option<&str> {
+        match self {
+            Position::Internal { query, .. } => Some(*query),
+            _ => None,
         }
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
-pub enum AuthMsg<'a> {
-    Ok,
-    Kerberos,
-    Cleartext,
-    Md5(&'a [u8]),
-    ScmCredential,
-    Gss,
-    Sspi,
-    GssContinue(&'a [u8]),
-    Unknown,
+#[derive(Clone, Debug, PartialEq)]
+pub struct NoticeBody<'a> {
+    severity_loc: &'a str,
+    severity: Option<Severity>,
+    code: &'a str,
+    message: &'a str,
+    detail: Option<&'a str>,
+    hint: Option<&'a str>,
+    position: Option<Position<'a>>,
+    more: Vec<(char, &'a str)>,
 }
 
-impl<'a> AuthMsg<'a> {
-    pub fn from_slice(extra: &'a [u8]) -> Result<AuthMsg> {
-        match slice_to_u32(&extra[0..4]) {
-            0 => Ok(AuthMsg::Ok),
-            2 => Ok(AuthMsg::Kerberos),
-            3 => Ok(AuthMsg::Cleartext),
-            5 => {
-                let salt = &extra[4..8];
-                Ok(AuthMsg::Md5(salt))
-            }
-            6 => Ok(AuthMsg::ScmCredential),
-            7 => Ok(AuthMsg::Gss),
-            8 => {
-                let gss_data = &extra[4..8];
-                Ok(AuthMsg::GssContinue(gss_data))
-            }
-            9 => Ok(AuthMsg::Sspi),
-            1 | 4 | 10..=255 => Ok(AuthMsg::Unknown),
-            _ => Err(PgError::Other),
+impl<'a> NoticeBody<'a> {
+    fn from_bytes(mut bytes: &'a [u8]) -> Result<NoticeBody<'a>> {
+        if bytes.is_empty() {
+            return Err(PgError::Error(format!("No terminator in {:?}", bytes)));
         }
-    }
-}
 
-pub fn take_msg(input: &[u8]) -> Result<(&[u8], &[u8])> {
-    if input.len() < 5 {
-        Err(PgError::Error(format!("Input too short: {:?}", input)))
-    } else {
-        let length = 1 + slice_to_u32(&input[1..5]) as usize;
-        if input.len() < length {
-            Err(PgError::Error(format!("Message too short: {:?}", input)))
+        let mut parts: HashMap<char, &str> = HashMap::new();
+        let mut more = Vec::new();
+        while bytes.get(0) != Some(&0) {
+            let indicator = bytes[0].into();
+            let (msg, _, end) = take_cstring_plus_fixed(&bytes[1..], 0).unwrap();
+            if ['S', 'V', 'C', 'M', 'D', 'H', 'P', 'p', 'q'].contains(&indicator) {
+                parts.insert(indicator, msg);
+            } else {
+                more.push((indicator, msg))
+            }
+            bytes = end;
+            if bytes.is_empty() {
+                return Err(PgError::Error(format!("No terminator in {:?}", bytes)));
+            }
+        }
+
+        let position: Option<Position> = if let Some(pos) = parts.get(&'P') {
+            Some(Position::Public(pos.parse()?))
+        } else if let Some(pos) = parts.get(&'p') {
+            Some(Position::Internal {
+                position: pos.parse()?,
+                query: parts.get(&'q').copied().unwrap_or_default(),
+            })
         } else {
-            Ok(input.split_at(length))
-        }
+            None
+        };
+
+        Ok(NoticeBody {
+            severity_loc: parts[&'S'],
+            severity: parts.get(&'V').copied().and_then(Severity::new),
+            code: parts[&'C'],
+            message: parts[&'M'],
+            detail: parts.get(&'D').copied(),
+            hint: parts.get(&'H').copied(),
+            position,
+            more,
+        })
+    }
+
+    pub fn message(&self) -> &str {
+        self.message
     }
 }
 
