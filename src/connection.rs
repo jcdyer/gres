@@ -1,12 +1,16 @@
 use crate::{
     auth,
     error::PgError,
-    message::{
+    Result,
+};
+use gres_protocol::messages::{
+    client::{
         BindMessage, CloseMessage, CloseType, Message, ParseMessage, PasswordMessage, Query,
         StartupMessage, Terminate,
     },
-    servermsg::{take_msg, AuthMsg, NoticeBody, ServerMsg},
-    Result,
+    server::{
+        take_msg, AuthMsg, NoticeBody, ServerMsg,
+    },
 };
 
 
