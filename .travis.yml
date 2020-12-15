@@ -9,5 +9,5 @@ matrix:
 cache: cargo
 services:
   - postgresql
-before_script:
-  - createdb -O $USER $USER
+#before_script:
+#  - createdb -O $USER $USER
